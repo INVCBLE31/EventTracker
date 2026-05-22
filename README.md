@@ -2,6 +2,8 @@
 
 > EventTracker автоматически собирает готовое `.exe` приложение для удобного запуска на Windows.
 
+<img width="256" height="256" alt="app_preview" src="https://github.com/user-attachments/assets/2666947a-cbb4-4b81-bbcc-adf276827b12" />
+
 ## Установка
 
 После сборки проекта необходимо:
