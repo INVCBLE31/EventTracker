@@ -4,6 +4,10 @@
 
 <img width="256" height="256" alt="app_preview" src="https://github.com/user-attachments/assets/2666947a-cbb4-4b81-bbcc-adf276827b12" />
 
+## Скриншоты
+
+<img width="1288" height="789" alt="Снимок экрана 2026-05-23 020001" src="https://github.com/user-attachments/assets/ac755260-9ec5-45a9-8bfd-97e1f39bc9b8" />
+
 ## Установка
 
 После сборки проекта необходимо:
