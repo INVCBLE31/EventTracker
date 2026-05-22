@@ -18,9 +18,7 @@ public partial class MainViewModel : ObservableObject
     private DispatcherTimer? _statsTimer;
     private CancellationTokenSource? _searchCts;
 
-    // Language: "EN" or "RU"
     [ObservableProperty] private string _currentLanguage = "EN";
-
     [ObservableProperty] private string _searchQuery = "";
     [ObservableProperty] private string _selectedCategory = "All";
     [ObservableProperty] private string _selectedAction = "All";
@@ -30,9 +28,7 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty] private int _todayEvents;
     [ObservableProperty] private string _selectedFolderPath = "";
     [ObservableProperty] private bool _isFolderView;
-    [ObservableProperty] private string _currentView = "Timeline"; // Timeline, Search, Folder, Dashboard, NoiseFilter
-
-    // Live scroll lock: when user scrolls up, we stop auto-appending to UI but keep recording
+    [ObservableProperty] private string _currentView = "Timeline";
     [ObservableProperty] private bool _isScrollLocked = false;
 
     public ObservableCollection<SystemEvent> LiveEvents { get; } = new();
@@ -42,11 +38,11 @@ public partial class MainViewModel : ObservableObject
     public ObservableCollection<ProcessStat> TopProcesses { get; } = new();
     public ObservableCollection<ProcessActivityStat> ProcessActivityStats { get; } = new();
 
-    // Buffered live events when scroll is locked
     private readonly Queue<SystemEvent> _pendingLiveEvents = new();
-
-    // Ignored processes set (synced with DB)
     private HashSet<string> _ignoredProcesses = new(StringComparer.OrdinalIgnoreCase);
+
+    // Maps FullPath → FolderNode for O(1) live tree lookup
+    private readonly Dictionary<string, FolderNode> _nodeIndex = new(StringComparer.OrdinalIgnoreCase);
 
     public List<string> Categories => CurrentLanguage == "RU"
         ? new() { "Все", "Файл", "Папка", "Процесс", "USB", "Сеть", "Ошибка", "Предупреждение" }
@@ -56,7 +52,6 @@ public partial class MainViewModel : ObservableObject
         ? new() { "Все", "Создан", "Удалён", "Изменён", "Переименован", "Запущен" }
         : new() { "All", "Created", "Deleted", "Modified", "Renamed", "Started" };
 
-    // UI string dictionary
     public string LblTimeline => CurrentLanguage == "RU" ? "Таймлайн" : "Timeline";
     public string LblDashboard => CurrentLanguage == "RU" ? "Дашборд" : "Dashboard";
     public string LblExport => CurrentLanguage == "RU" ? "Экспорт" : "Export";
@@ -95,7 +90,6 @@ public partial class MainViewModel : ObservableObject
 
     private async Task InitializeAsync()
     {
-        // FIX: Load ignored processes and SYNC them to FileMonitoringService
         _ignoredProcesses = await _db.GetIgnoredProcessesAsync();
         _fileSvc.SetIgnoredProcesses(_ignoredProcesses);
 
@@ -110,13 +104,15 @@ public partial class MainViewModel : ObservableObject
 
     private void OnEventOccurred(SystemEvent ev)
     {
-        // FIX: Check IgnoredProcesses on the FileMonitoringService (always up to date)
         if (!string.IsNullOrEmpty(ev.ProcessName) &&
             _ignoredProcesses.Contains(ev.ProcessName))
             return;
 
         _dispatcher.BeginInvoke(() =>
         {
+            // Update live tree sidebar
+            UpdateTreeForEvent(ev);
+
             if (IsScrollLocked)
             {
                 _pendingLiveEvents.Enqueue(ev);
@@ -136,11 +132,148 @@ public partial class MainViewModel : ObservableObject
         });
     }
 
+    // =====================================================================
+    // LIVE TREE UPDATE — called on every file system event on the UI thread
+    // =====================================================================
+    private void UpdateTreeForEvent(SystemEvent ev)
+    {
+        try
+        {
+            string path = ev.Path;
+            string action = ev.Action;
+            bool isDir = ev.Category == "Folder";
+
+            // Find the parent node (directory containing the changed item)
+            string parentPath = System.IO.Path.GetDirectoryName(path) ?? "";
+
+            switch (action)
+            {
+                case "Created":
+                    // Add node to parent if parent is loaded in tree
+                    if (_nodeIndex.TryGetValue(parentPath, out var parentNode) && parentNode.IsLoaded)
+                    {
+                        string itemName = System.IO.Path.GetFileName(path);
+                        // Don't add duplicates
+                        if (!parentNode.Children.Any(c => c.FullPath.Equals(path, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            var newNode = isDir
+                                ? new FolderNode
+                                {
+                                    Name = "📁 " + itemName,
+                                    FullPath = path,
+                                    Children = new System.Collections.ObjectModel.ObservableCollection<FolderNode>
+                                        { new FolderNode { Name = "..." } }
+                                }
+                                : new FolderNode
+                                {
+                                    Name = "📄 " + itemName,
+                                    FullPath = path,
+                                    IsFile = true
+                                };
+
+                            // Insert in sorted order: folders first, then files, alphabetically
+                            int insertIdx = FindInsertIndex(parentNode.Children, newNode);
+                            parentNode.Children.Insert(insertIdx, newNode);
+                            if (!newNode.IsFile)
+                                _nodeIndex[path] = newNode;
+                        }
+                    }
+                    break;
+
+                case "Deleted":
+                    // Remove node from parent
+                    if (_nodeIndex.TryGetValue(parentPath, out var delParent) && delParent.IsLoaded)
+                    {
+                        var toRemove = delParent.Children.FirstOrDefault(
+                            c => c.FullPath.Equals(path, StringComparison.OrdinalIgnoreCase));
+                        if (toRemove != null)
+                        {
+                            delParent.Children.Remove(toRemove);
+                            _nodeIndex.Remove(path);
+                        }
+                    }
+                    break;
+
+                case "Renamed":
+                    // Rename = old path deleted, new path created
+                    // ev.Path is the NEW path, ev.Details contains old→new info
+                    // Handle by removing old + adding new in parent
+                    if (_nodeIndex.TryGetValue(parentPath, out var renParent) && renParent.IsLoaded)
+                    {
+                        // Try to find existing node by checking if any child's name matches old filename from Details
+                        // Since we only have the new path in ev.Path, remove any child matching old names and add new
+                        string newName = System.IO.Path.GetFileName(path);
+
+                        // Remove old (could be any node whose path no longer exists)
+                        var stale = renParent.Children
+                            .Where(c => !c.IsFile
+                                ? !Directory.Exists(c.FullPath)
+                                : !File.Exists(c.FullPath))
+                            .ToList();
+                        foreach (var s in stale)
+                        {
+                            renParent.Children.Remove(s);
+                            _nodeIndex.Remove(s.FullPath);
+                        }
+
+                        // Add new if not already present
+                        if (!renParent.Children.Any(c => c.FullPath.Equals(path, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            var renamedNode = isDir
+                                ? new FolderNode
+                                {
+                                    Name = "📁 " + newName,
+                                    FullPath = path,
+                                    Children = new System.Collections.ObjectModel.ObservableCollection<FolderNode>
+                                        { new FolderNode { Name = "..." } }
+                                }
+                                : new FolderNode
+                                {
+                                    Name = "📄 " + newName,
+                                    FullPath = path,
+                                    IsFile = true
+                                };
+                            int insertIdx = FindInsertIndex(renParent.Children, renamedNode);
+                            renParent.Children.Insert(insertIdx, renamedNode);
+                            if (!renamedNode.IsFile)
+                                _nodeIndex[path] = renamedNode;
+                        }
+                    }
+                    break;
+            }
+        }
+        catch { /* Never crash the UI thread */ }
+    }
+
+    // Insert folders before files, both alphabetically
+    private static int FindInsertIndex(
+        System.Collections.ObjectModel.ObservableCollection<FolderNode> children,
+        FolderNode newNode)
+    {
+        // Skip placeholder "..." node
+        if (children.Count == 1 && children[0].Name == "...")
+            return 0;
+
+        for (int i = 0; i < children.Count; i++)
+        {
+            var c = children[i];
+            if (c.Name == "...") continue;
+
+            // Folders before files
+            if (newNode.IsFile && !c.IsFile) continue;
+            if (!newNode.IsFile && c.IsFile) return i;
+
+            // Alphabetical within same type
+            if (string.Compare(newNode.Name, c.Name, StringComparison.OrdinalIgnoreCase) < 0)
+                return i;
+        }
+        return children.Count;
+    }
+
     [RelayCommand]
     private void ResumeScroll()
     {
         IsScrollLocked = false;
-        // Flush pending events
         while (_pendingLiveEvents.Count > 0)
         {
             var ev = _pendingLiveEvents.Dequeue();
@@ -149,28 +282,23 @@ public partial class MainViewModel : ObservableObject
             TotalEvents++;
         }
         if (LiveEvents.Count > 500)
-        {
             while (LiveEvents.Count > 500)
                 LiveEvents.RemoveAt(LiveEvents.Count - 1);
-        }
         StatusText = LblStatusMonitoring;
     }
 
     public void SetScrollLocked(bool locked)
     {
         IsScrollLocked = locked;
-        if (!locked)
-            ResumeScrollCommand.Execute(null);
+        if (!locked) ResumeScrollCommand.Execute(null);
     }
 
-    // FIX: Build drive nodes with real Volume Labels and proper display names
     private void InitializeDrives()
     {
         foreach (var drive in DriveInfo.GetDrives())
         {
             if (!drive.IsReady) continue;
 
-            // Build a nice display name: Letter + Label (if any) + Type
             string driveLetter = drive.Name.TrimEnd('\\');
             string label = "";
             try { label = drive.VolumeLabel; } catch { }
@@ -193,14 +321,14 @@ public partial class MainViewModel : ObservableObject
                 Name = displayName,
                 FullPath = drive.RootDirectory.FullName,
                 IsDrive = true,
-                // Placeholder child so the expand arrow appears
-                Children = new List<FolderNode> { new FolderNode { Name = "..." } }
+                Children = new System.Collections.ObjectModel.ObservableCollection<FolderNode>
+                    { new FolderNode { Name = "..." } }
             };
             DriveNodes.Add(node);
+            _nodeIndex[drive.RootDirectory.FullName] = node;
         }
     }
 
-    // FIX: Load both FOLDERS and FILES for the sidebar tree
     public void LoadFolderChildren(FolderNode node)
     {
         if (node.IsLoaded) return;
@@ -209,32 +337,32 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
-            // Add subdirectories first
-            var dirs = Directory.GetDirectories(node.FullPath)
-                .OrderBy(d => d)
-                .Take(300)
-                .Select(d => new FolderNode
+            // Folders first
+            foreach (var d in Directory.GetDirectories(node.FullPath).OrderBy(x => x).Take(300))
+            {
+                var child = new FolderNode
                 {
                     Name = "📁 " + System.IO.Path.GetFileName(d),
                     FullPath = d,
-                    // Placeholder so expand arrow shows
-                    Children = new List<FolderNode> { new FolderNode { Name = "..." } }
-                });
-            foreach (var d in dirs)
-                node.Children.Add(d);
+                    Children = new System.Collections.ObjectModel.ObservableCollection<FolderNode>
+                        { new FolderNode { Name = "..." } }
+                };
+                node.Children.Add(child);
+                // Register in index for live updates
+                if (!_nodeIndex.ContainsKey(d))
+                    _nodeIndex[d] = child;
+            }
 
-            // Add files
-            var files = Directory.GetFiles(node.FullPath)
-                .OrderBy(f => f)
-                .Take(200)
-                .Select(f => new FolderNode
+            // Files after folders
+            foreach (var f in Directory.GetFiles(node.FullPath).OrderBy(x => x).Take(200))
+            {
+                node.Children.Add(new FolderNode
                 {
                     Name = "📄 " + System.IO.Path.GetFileName(f),
                     FullPath = f,
                     IsFile = true
                 });
-            foreach (var f in files)
-                node.Children.Add(f);
+            }
         }
         catch { }
     }
@@ -247,7 +375,6 @@ public partial class MainViewModel : ObservableObject
         CurrentView = "Folder";
         SearchResults.Clear();
 
-        // FIX: For files, show events for parent directory filtered to filename
         if (node.IsFile)
         {
             var events = await _db.GetFileEventsAsync(node.FullPath);
@@ -367,7 +494,6 @@ public partial class MainViewModel : ObservableObject
     public async Task RefreshNoiseFilterAsync()
     {
         _ignoredProcesses = await _db.GetIgnoredProcessesAsync();
-        // FIX: Always sync to FileMonitoringService when refreshing
         _fileSvc.SetIgnoredProcesses(_ignoredProcesses);
 
         var stats = await _db.GetProcessActivityStatsAsync(50);
@@ -392,7 +518,6 @@ public partial class MainViewModel : ObservableObject
             await _db.AddIgnoredProcessAsync(processName);
             _ignoredProcesses.Add(processName);
         }
-        // FIX: Sync updated set to monitoring service
         _fileSvc.SetIgnoredProcesses(_ignoredProcesses);
         await RefreshNoiseFilterAsync();
     }
@@ -406,7 +531,6 @@ public partial class MainViewModel : ObservableObject
         if (MessageBox.Show(msg, "Confirm", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
         {
             await _db.ClearProcessEventsAsync(processName);
-            // Remove from live view
             var toRemove = LiveEvents.Where(e => e.ProcessName.Equals(processName, StringComparison.OrdinalIgnoreCase)).ToList();
             foreach (var e in toRemove) LiveEvents.Remove(e);
             await RefreshNoiseFilterAsync();
@@ -436,7 +560,6 @@ public partial class MainViewModel : ObservableObject
     private void ToggleLanguage()
     {
         CurrentLanguage = CurrentLanguage == "EN" ? "RU" : "EN";
-        // Refresh all localized properties
         OnPropertyChanged(nameof(Categories));
         OnPropertyChanged(nameof(Actions));
         OnPropertyChanged(nameof(LblTimeline));
@@ -459,7 +582,6 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(LblClear));
         OnPropertyChanged(nameof(LblIgnored));
 
-        // Reset filters to default (avoid mismatches)
         _selectedCategory = Categories[0];
         _selectedAction = Actions[0];
         OnPropertyChanged(nameof(SelectedCategory));
@@ -518,9 +640,6 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    // FIX: OpenFolder now opens the exact location in Explorer
-    // For files: selects the file in its folder
-    // For folders: opens the folder directly
     [RelayCommand]
     public void OpenFolder(string path)
     {
@@ -533,7 +652,6 @@ public partial class MainViewModel : ObservableObject
                 System.Diagnostics.Process.Start("explorer.exe", $"\"{path}\"");
             else
             {
-                // Path no longer exists — try opening the parent folder
                 var parent = System.IO.Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent))
                     System.Diagnostics.Process.Start("explorer.exe", $"\"{parent}\"");
@@ -542,7 +660,6 @@ public partial class MainViewModel : ObservableObject
         catch { }
     }
 
-    // FIX: Open the location of any log event in Explorer
     [RelayCommand]
     public void OpenEventLocation(SystemEvent ev)
     {

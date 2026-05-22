@@ -1,3 +1,7 @@
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+
 namespace EventTracker.Models;
 
 public class SystemEvent
@@ -41,21 +45,40 @@ public class SystemEvent
         _ => "#94A3B8"
     };
 
-    // FilePath is an alias for Path to avoid WPF binding collision with FrameworkElement.Path
     public string FilePath => Path;
 }
 
-public class FolderNode
+// FolderNode implements INotifyPropertyChanged so the TreeView reacts to live changes
+public class FolderNode : INotifyPropertyChanged
 {
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private bool _isExpanded;
+    private bool _isSelected;
+
     public string Name { get; set; } = "";
     public string FullPath { get; set; } = "";
-    public bool IsExpanded { get; set; }
-    public bool IsSelected { get; set; }
-    public List<FolderNode> Children { get; set; } = new();
     public bool IsLoaded { get; set; }
     public bool IsDrive { get; set; }
-    // FIX: Track whether this node represents a file (leaf) vs folder
     public bool IsFile { get; set; }
+
+    public bool IsExpanded
+    {
+        get => _isExpanded;
+        set { _isExpanded = value; OnPropertyChanged(); }
+    }
+
+    public bool IsSelected
+    {
+        get => _isSelected;
+        set { _isSelected = value; OnPropertyChanged(); }
+    }
+
+    // ObservableCollection so TreeView updates live when children are added/removed
+    public ObservableCollection<FolderNode> Children { get; set; } = new();
+
+    protected void OnPropertyChanged([CallerMemberName] string? name = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
 
 public class ActivityStat
@@ -66,18 +89,12 @@ public class ActivityStat
     public string Color { get; set; } = "#60A5FA";
 }
 
-/// <summary>
-/// Replaces (string Label, int Count) tuples for WPF binding compatibility.
-/// </summary>
 public class ProcessStat
 {
     public string Label { get; set; } = "";
     public int Count { get; set; }
 }
 
-/// <summary>
-/// Represents a process with total file activity count for the Noise Filter / Top Processes view.
-/// </summary>
 public class ProcessActivityStat
 {
     public string ProcessName { get; set; } = "";
