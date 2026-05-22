@@ -1,3 +1,0 @@
-@echo off
-echo Starting EventTracker...
-dotnet run --project EventTracker.csproj
