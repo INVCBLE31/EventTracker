@@ -206,36 +206,6 @@ D:/Games/Minecraft/
 
 ---
 
-# Архитектура проекта
-
-```text
-EventTracker/
-│
-├── Core/
-│   ├── Models/
-│   ├── Services/
-│   ├── Database/
-│   └── Logging/
-│
-├── Monitoring/
-│   ├── FileMonitoringService
-│   ├── ProcessMonitoringService
-│   ├── UsbMonitoringService
-│   └── NetworkMonitoringService
-│
-├── UI/
-│   ├── Views/
-│   ├── ViewModels/
-│   └── Components/
-│
-├── Search/
-│   └── SearchService
-│
-└── EventTracker.sln
-```
-
----
-
 # База данных
 
 Используется SQLite.
